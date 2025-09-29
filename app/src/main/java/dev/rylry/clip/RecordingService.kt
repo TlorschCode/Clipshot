@@ -1,6 +1,7 @@
 package dev.rylry.clip
 
 import android.Manifest
+import android.R
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
@@ -22,9 +23,17 @@ import android.hardware.camera2.CameraAccessException
 import android.os.Binder
 import android.os.IBinder
 import android.util.Log
+import android.util.Size
 import android.view.Surface
 import androidx.annotation.RequiresPermission
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.LifecycleRegistry
 import java.io.File
 import java.nio.ByteBuffer
 import kotlin.math.min
@@ -45,13 +54,14 @@ class RecordingService : Service() {
     var record: AudioRecord? = null
 
     lateinit var cameraDevice: CameraDevice
-    lateinit var videoBuffer : ArrayDeque<Pair<ByteArray, MediaCodec.BufferInfo>>
+    var videoBuffer = ArrayDeque<Pair<ByteArray, MediaCodec.BufferInfo>>()
     lateinit var encoder: MediaCodec
     lateinit var inputSurface: Surface
 
     private var videoBasePts: Long = -1
     private var lastVideoPts: Long = 0
 
+    private var cameraProvider: ProcessCameraProvider? = null
     private val binder = AudioServiceBinder()
 
     inner class AudioServiceBinder : Binder() {
@@ -83,7 +93,7 @@ class RecordingService : Service() {
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("Recording Audio")
             .setContentText("Your audio is being recorded")
-            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setSmallIcon(R.drawable.ic_btn_speak_now)
             .build()
 
         // Start foreground
@@ -91,7 +101,7 @@ class RecordingService : Service() {
 
         // Start recording in background thread
         startRecording()
-        startCamera()
+        setupCameraX()
 
         return START_STICKY
     }
@@ -118,8 +128,19 @@ class RecordingService : Service() {
         record?.startRecording()
         recordingThread = Thread {
             while (isRecording) {
-                record?.read(audioBuffer, audioWritePointer, if(audioWritePointer + audioChunkSize < audioBufferSize) audioChunkSize else audioBufferSize - audioWritePointer)
-                if(audioWritePointer + audioChunkSize >= audioBufferSize) record?.read(audioBuffer, 0, audioChunkSize - audioBufferSize + audioWritePointer)
+                val firstChunkSize = min(audioChunkSize, audioBufferSize - audioWritePointer)
+
+                // Read up to firstChunkSize frames
+                val readFirst = record?.read(audioBuffer, audioWritePointer, firstChunkSize) ?: 0
+
+                // If there’s remaining to wrap around the circular buffer
+                val remaining = audioChunkSize - readFirst
+                if (remaining > 0) {
+                    // Only read as much as fits at the start of the buffer
+                    record?.read(audioBuffer, 0, remaining)
+                }
+
+                // Advance the write pointer
                 audioWritePointer = (audioWritePointer + audioChunkSize) % audioBufferSize
             }
         }
@@ -136,164 +157,191 @@ class RecordingService : Service() {
         record?.stop()
     }
 
+    /**
+     * Selects a camera and starts recording
+     */
     @RequiresPermission(Manifest.permission.CAMERA)
-    fun startCamera() {
-        val manager: CameraManager = getSystemService(CAMERA_SERVICE) as CameraManager
+    private fun setupCameraX() {
+        val manager = getSystemService(CAMERA_SERVICE) as CameraManager
 
-        val cameras = try {
-            manager.cameraIdList.filter {
+        // 1. Pick back-facing camera
+        val cameraId = try {
+            manager.cameraIdList.firstOrNull {
                 val characteristics = manager.getCameraCharacteristics(it)
-                val lensFacing = characteristics.get(CameraCharacteristics.LENS_FACING)
-                lensFacing != null && lensFacing == CameraCharacteristics.LENS_FACING_BACK
+                characteristics.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
+            } ?: run {
+                Log.w("RecordingService", "No back-facing camera found")
+                return
             }
         } catch (e: Exception) {
-            Log.e("RecordingService", "Failed to get camera list: ${e.message}")
+            Log.e("RecordingService", "Failed to get camera list: ${e.message} ${e.stackTrace} ${e.stackTrace}")
             return
-        }
-
-        if (cameras.isEmpty()) {
-            Log.w("RecordingService", "No suitable back-facing camera found")
-            return
-        }
-
-        val camera = cameras[0]
-        try {
-            manager.openCamera(camera, object : CameraDevice.StateCallback() {
-                override fun onDisconnected(camera: CameraDevice) {
-                    try {
-                        camera.close()
-                    } catch (e: Exception) {
-                        Log.w("RecordingService", "Error closing disconnected camera: ${e.message}")
-                    }
-                }
-
-                override fun onError(camera: CameraDevice, error: Int) {
-                    Log.w("RecordingService", "Camera error $error")
-                    try {
-                        camera.close()
-                    } catch (e: Exception) {
-                        Log.w("RecordingService", "Error closing camera on error: ${e.message}")
-                    }
-                }
-
-                override fun onOpened(camera: CameraDevice) {
-                    cameraDevice = camera
-                    setupCaptureSession()
-                }
-            }, null)
-        } catch (e: CameraAccessException) {
-            Log.e("RecordingService", "Camera access exception: ${e.message}")
-        } catch (e: SecurityException) {
-            Log.e("RecordingService", "Camera permission missing: ${e.message}")
-        } catch (e: Exception) {
-            Log.e("RecordingService", "Unknown camera open exception: ${e.message}")
         }
 
         val characteristics = try {
-            manager.getCameraCharacteristics(camera)
+            manager.getCameraCharacteristics(cameraId)
         } catch (e: Exception) {
-            Log.w("RecordingService", "Failed to get camera characteristics: ${e.message}")
+            Log.e("RecordingService", "Failed to get camera characteristics: ${e.message} ${e.stackTrace}")
             return
         }
 
-        val map = try {
-            characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return
-        } catch (e: Exception) {
-            Log.w("RecordingService", "Failed to get stream configuration map: ${e.message}")
+        val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        if (map == null) {
+            Log.e("RecordingService", "No stream configuration map available")
             return
         }
 
+        // 2. Get encoder capabilities
         val codecList = MediaCodecList(MediaCodecList.REGULAR_CODECS)
-        val codecInfo = try {
-            codecList.codecInfos.first { it.isEncoder && it.supportedTypes.contains(MediaFormat.MIMETYPE_VIDEO_AVC) }
-        } catch (e: Exception) {
-            Log.e("RecordingService", "No suitable encoder found: ${e.message}")
+        val codecInfo = codecList.codecInfos.firstOrNull {
+            it.isEncoder && it.supportedTypes.contains(MediaFormat.MIMETYPE_VIDEO_AVC)
+        } ?: run {
+            Log.e("RecordingService", "No suitable H.264 encoder found")
             return
         }
 
         val videoCaps = codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC).videoCapabilities
-        val supportedCameraSizes = map.getOutputSizes(ImageFormat.YUV_420_888)
-        val size = supportedCameraSizes
-            .firstOrNull { s -> videoCaps.isSizeSupported(s.width, s.height) }
-            ?: supportedCameraSizes.first()
 
-        val supportedFpsRange = videoCaps.getSupportedFrameRatesFor(size.width, size.height)
-        val fps: Int = supportedFpsRange.upper.toInt()
+        // 3. Pick resolution
+        val supportedSizes = map.getOutputSizes(ImageFormat.YUV_420_888) ?: arrayOf()
+        val size = supportedSizes.firstOrNull { s ->
+            videoCaps.isSizeSupported(s.width, s.height)
+        } ?: supportedSizes.firstOrNull() ?: run {
+            Log.e("RecordingService", "No compatible resolution found")
+            return
+        }
 
-        val bitsPerPixel = 0.1
-        val bitRate = (size.width * size.height * fps * bitsPerPixel).toInt()
+        // 4. Pick FPS
+        val fpsRange = videoCaps.getSupportedFrameRatesFor(size.width, size.height)
+        val fps = fpsRange.upper.toInt().coerceAtMost(30) // cap at 30 fps for stability
 
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, size.width, size.height)
-            .apply {
+        // 5. Compute bitrate (basic formula: w*h*fps*0.1)
+        val bitRate = (size.width * size.height * fps * 0.1).toInt()
+
+        Log.d("RecordingService", "Selected resolution: ${size.width}x${size.height}, fps: $fps, bitrate: $bitRate")
+
+        // 6. Setup encoder and start camera
+        setupEncoderX(size.width, size.height, fps, bitRate)
+    }
+
+    /**
+     * Sets up encoder with CameraX API
+     * @param width width of the video recording
+     * @param height height of the video recording
+     * @param fps number of fps to start recording video at
+     * @param bitRate bit rate to use for encoder
+     */
+    private fun setupEncoderX(width: Int, height: Int, fps: Int, bitRate: Int) {
+        try {
+            // Configure MediaFormat
+            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+                setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
                 setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
                 setInteger(MediaFormat.KEY_FRAME_RATE, fps)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-                setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             }
 
-        try {
+            // Create and configure encoder
             encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
             encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-
-            val videoBufferSize = fps * 30
-            videoBuffer = ArrayDeque<Pair<ByteArray, MediaCodec.BufferInfo>>(videoBufferSize)
-
             encoder.setCallback(object : MediaCodec.Callback() {
                 override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
-                    Log.e("RecordingService", "Encoder error: ${e.message}")
+                    Log.e("RecordingService", "Encoder error: ${e.message} ${e.stackTrace}")
                 }
 
                 override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {
-                    // No-op
+                    // No-op for Surface input
                 }
 
                 override fun onOutputBufferAvailable(codec: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
-                    try {
-                        if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
-                            codec.releaseOutputBuffer(index, false)
-                            return
-                        }
+                    val outputBuffer = codec.getOutputBuffer(index)
+                    if (outputBuffer != null && info.size > 0) {
+                        outputBuffer.position(info.offset)
+                        outputBuffer.limit(info.offset + info.size)
 
-                        if (info.size > 0) {
-                            val encodedData = codec.getOutputBuffer(index) ?: return
-                            encodedData.position(info.offset)
-                            encodedData.limit(info.offset + info.size)
+                        // Copy or write to ring buffer
+                        val frameBytes = ByteArray(info.size)
+                        outputBuffer.get(frameBytes)
 
-                            if (videoBasePts < 0) videoBasePts = info.presentationTimeUs
-                            val pts = info.presentationTimeUs - videoBasePts
-                            val flags = if (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0 || videoBuffer.isEmpty()) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
-                            val frameBytes = ByteArray(info.size)
-                            encodedData.get(frameBytes)
-
-                            synchronized(videoBuffer) {
-                                while (videoBuffer.isNotEmpty() && pts - videoBuffer.first().second.presentationTimeUs > recordDurationSeconds * 1_000_000) {
-                                    videoBuffer.removeFirst()
-                                }
-                                videoBuffer.addLast(Pair(
-                                    frameBytes,
-                                    MediaCodec.BufferInfo().apply { set(info.offset, info.size, pts, flags) }
-                                ))
+                        synchronized(videoBuffer) {
+                            while (videoBuffer.isNotEmpty() &&
+                                info.presentationTimeUs - videoBuffer.first().second.presentationTimeUs > recordDurationSeconds * 1_000_000
+                            ) {
+                                videoBuffer.removeFirst()
                             }
-                        } else {
-                            Log.w("RecordingService", "Empty output buffer. Flags: ${info.flags}")
+                            videoBuffer.addLast(Pair(frameBytes, MediaCodec.BufferInfo().apply {
+                                set(info.offset, info.size, info.presentationTimeUs, info.flags)
+                            }))
                         }
-                    } catch (e: Exception) {
-                        Log.e("RecordingService", "Error handling output buffer: ${e.message}")
-                    } finally {
-                        try { codec.releaseOutputBuffer(index, false) } catch (_: Exception) {}
                     }
+                    codec.releaseOutputBuffer(index, false)
                 }
 
                 override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
-                    // No-op
+                    Log.d("RecordingService", "Encoder format changed: $format")
                 }
             })
 
+            // Create input surface for encoder
             inputSurface = encoder.createInputSurface()
+
+            // Start the encoder
             encoder.start()
+
+            // Start camera with encoder surface
+            cameraLifecycleInit(inputSurface)
+
+            // Optional: setup callback to capture output buffers
+
         } catch (e: Exception) {
-            Log.e("RecordingService", "Failed to configure/start encoder: ${e.message}")
+            Log.e("RecordingService", "Failed to setup encoder: ${e.message} ${e.stackTrace}")
         }
+    }
+
+    /**
+     * Starts camera with CameraX API and outputs to a surface
+     */
+    private fun cameraLifecycleInit(videoSurface: Surface) {
+        val context = this // service context
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
+
+        cameraProviderFuture.addListener({
+            cameraProvider = cameraProviderFuture.get()
+            cameraProvider?.unbindAll()
+
+            val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+
+            // Get width/height from encoder's configured format
+            val encoderFormat = encoder.outputFormat
+            val width = encoderFormat.getInteger(MediaFormat.KEY_WIDTH)
+            val height = encoderFormat.getInteger(MediaFormat.KEY_HEIGHT)
+            val targetSize = Size(width, height)
+
+            // Preview use-case is required for CameraX, but we won't display it
+            val preview = Preview.Builder()
+                .setTargetResolution(targetSize)
+                .build()
+                .also { p ->
+                    p.setSurfaceProvider { request ->
+                        request.provideSurface(
+                            videoSurface,
+                            ContextCompat.getMainExecutor(context)
+                        ) { }
+                    }
+                }
+
+            try {
+                val lifecycleOwner = ServiceLifecycleOwner()
+                cameraProvider?.bindToLifecycle(
+                    lifecycleOwner,
+                    cameraSelector,
+                    preview
+                )
+            } catch (exc: Exception) {
+                exc.printStackTrace()
+            }
+
+        }, ContextCompat.getMainExecutor(context))
     }
 
     private fun setupCaptureSession() {
@@ -307,9 +355,9 @@ class RecordingService : Service() {
                         }
                         session.setRepeatingRequest(captureRequestBuilder.build(), null, null)
                     } catch (e: CameraAccessException) {
-                        Log.w("RecordingService", "Failed to start repeating request: ${e.message}")
+                        Log.w("RecordingService", "Failed to start repeating request: ${e.message} ${e.stackTrace}")
                     } catch (e: IllegalStateException) {
-                        Log.w("RecordingService", "Capture session illegal state: ${e.message}")
+                        Log.w("RecordingService", "Capture session illegal state: ${e.message} ${e.stackTrace}")
                     }
                 }
 
@@ -318,29 +366,13 @@ class RecordingService : Service() {
                 }
             }, null)
         } catch (e: CameraAccessException) {
-            Log.w("RecordingService", "Failed to create capture session: ${e.message}")
+            Log.w("RecordingService", "Failed to create capture session: ${e.message} ${e.stackTrace}")
         } catch (e: IllegalStateException) {
-            Log.w("RecordingService", "Camera device illegal state during capture session creation: ${e.message}")
+            Log.w("RecordingService", "Camera device illegal state during capture session creation: ${e.message} ${e.stackTrace}")
         } catch (e: Exception) {
-            Log.w("RecordingService", "Unknown error creating capture session: ${e.message}")
+            Log.w("RecordingService", "Unknown error creating capture session: ${e.message} ${e.stackTrace}")
         }
     }
-
-
-//    private fun setupCaptureSession() {
-//        val surfaces = listOf(inputSurface)
-//        cameraDevice.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
-//            override fun onConfigured(session: CameraCaptureSession) {
-//                val captureRequestBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-//                    addTarget(inputSurface) // Surface where frames will go
-//                }
-//
-//                // Start the session
-//                session.setRepeatingRequest(captureRequestBuilder.build(), null, null)
-//            }
-//            override fun onConfigureFailed(session: CameraCaptureSession) { /* ... */ }
-//        }, null)
-//    }
     fun saveBuffersMP4() {
         // Retrieve and prepare audio PCM data from the in-memory buffer
         val first = audioBuffer.copyOfRange(audioWritePointer, audioBuffer.size)
@@ -437,11 +469,19 @@ class RecordingService : Service() {
         muxer.start()
 
         // --- Write all frames to muxer in chronological order ---
-        val allFrames = (encodedAudioFrames.map { (bytes, info) ->
+        val videoBasePts = try {
+            videoBuffer.first().second.presentationTimeUs
+        } catch(e: NoSuchElementException){
+            0
+        }
+
+        val allFrames = encodedAudioFrames.map { (bytes, info) ->
             FrameWrapper(bytes, info, audioTrackIndex)
         } + videoBuffer.map { (bytes, info) ->
-            FrameWrapper(bytes, info, videoTrackIndex)
-        }).sortedBy { it.info.presentationTimeUs }
+            FrameWrapper(bytes, MediaCodec.BufferInfo().apply {
+                set(info.offset, info.size, info.presentationTimeUs - videoBasePts, info.flags)
+            }, videoTrackIndex)
+        }.sortedBy { it.info.presentationTimeUs }
 
         for (frame in allFrames) {
             muxer.writeSampleData(frame.trackIndex, ByteBuffer.wrap(frame.bytes), frame.info)
@@ -460,4 +500,13 @@ class RecordingService : Service() {
         val info: MediaCodec.BufferInfo,
         val trackIndex: Int
     )
+    // Helper class to keep track of camera state
+    private class ServiceLifecycleOwner() : LifecycleOwner {
+        override val lifecycle = LifecycleRegistry(this)
+        private val lifecycleRegistry = LifecycleRegistry(this)
+        init {
+            // Keep it always RESUMED so CameraX keeps running
+            lifecycleRegistry.currentState = Lifecycle.State.RESUMED
+        }
+    }
 }
