@@ -90,7 +90,7 @@ class RecordingService : Service() {
         startForeground(1, notification)
 
         // Start recording in background thread
-        startRecording()
+        startAudio()
         startCamera()
 
         return START_STICKY
@@ -113,13 +113,22 @@ class RecordingService : Service() {
         manager.createNotificationChannel(channel)
     }
 
-    fun startRecording(){
+    fun startAudio(){
         isRecording = true
         record?.startRecording()
         recordingThread = Thread {
             while (isRecording) {
-                record?.read(audioBuffer, audioWritePointer, if(audioWritePointer + audioChunkSize < audioBufferSize) audioChunkSize else audioBufferSize - audioWritePointer)
-                if(audioWritePointer + audioChunkSize >= audioBufferSize) record?.read(audioBuffer, 0, audioChunkSize - audioBufferSize + audioWritePointer)
+                val firstChunkSize = min(audioChunkSize, audioBufferSize - audioWritePointer)
+
+                // Read up to firstChunkSize frames
+                val readFirst = record?.read(audioBuffer, audioWritePointer, firstChunkSize) ?: 0
+
+                // If there’s remaining to wrap around the circular buffer
+                val remaining = audioChunkSize - readFirst
+                if (remaining > 0) {
+                    // Only read as much as fits at the start of the buffer
+                    record?.read(audioBuffer, 0, remaining)
+                }
                 audioWritePointer = (audioWritePointer + audioChunkSize) % audioBufferSize
             }
         }
@@ -325,23 +334,7 @@ class RecordingService : Service() {
             Log.w("RecordingService", "Unknown error creating capture session: ${e.message}")
         }
     }
-
-
-//    private fun setupCaptureSession() {
-//        val surfaces = listOf(inputSurface)
-//        cameraDevice.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
-//            override fun onConfigured(session: CameraCaptureSession) {
-//                val captureRequestBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-//                    addTarget(inputSurface) // Surface where frames will go
-//                }
-//
-//                // Start the session
-//                session.setRepeatingRequest(captureRequestBuilder.build(), null, null)
-//            }
-//            override fun onConfigureFailed(session: CameraCaptureSession) { /* ... */ }
-//        }, null)
-//    }
-    fun saveBuffersMP4() {
+    fun saveMedia() {
         // Retrieve and prepare audio PCM data from the in-memory buffer
         val first = audioBuffer.copyOfRange(audioWritePointer, audioBuffer.size)
         val second = audioBuffer.copyOfRange(0, audioWritePointer)
@@ -437,13 +430,21 @@ class RecordingService : Service() {
         muxer.start()
 
         // --- Write all frames to muxer in chronological order ---
+        val videoBasePts = try {
+            videoBuffer.first().second.presentationTimeUs
+        } catch(e: NoSuchElementException){
+            0
+        }
         val allFrames = (encodedAudioFrames.map { (bytes, info) ->
             FrameWrapper(bytes, info, audioTrackIndex)
         } + videoBuffer.map { (bytes, info) ->
-            FrameWrapper(bytes, info, videoTrackIndex)
-        }).sortedBy { it.info.presentationTimeUs }
+            FrameWrapper(bytes, MediaCodec.BufferInfo().apply {
+                set(info.offset, info.size, info.presentationTimeUs - videoBasePts, info.flags)
+            }, videoTrackIndex)
+        }.sortedBy { it.info.presentationTimeUs })
 
-        for (frame in allFrames) {
+
+    for (frame in allFrames) {
             muxer.writeSampleData(frame.trackIndex, ByteBuffer.wrap(frame.bytes), frame.info)
         }
 

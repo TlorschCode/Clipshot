@@ -36,7 +36,7 @@ class MainActivity : ComponentActivity() {
             text = "Save Current Buffer"
             setOnClickListener {
                 if (bound) {
-                    recordingService?.saveBuffersMP4()
+                    recordingService?.saveMedia()
                     Toast.makeText(this@MainActivity, "Buffer saved!", Toast.LENGTH_SHORT).show()
                 } else {
                     Toast.makeText(this@MainActivity, "Service not bound", Toast.LENGTH_SHORT)
