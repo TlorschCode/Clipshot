@@ -3,8 +3,12 @@ package dev.rylry.clip
 import android.Manifest
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
@@ -66,6 +70,7 @@ class RecordingService : Service() {
     @RequiresPermission(allOf = [Manifest.permission.RECORD_AUDIO])
     override fun onCreate() {
         super.onCreate()
+        registerReceiver(saveReceiver, IntentFilter("dev.rylry.SAVE_BUFFERS"), Context.RECEIVER_EXPORTED)
         record = AudioRecord(
             MediaRecorder.AudioSource.MIC,
             sampleRateHz,
@@ -75,8 +80,14 @@ class RecordingService : Service() {
         )
     }
 
-    @RequiresPermission(allOf = [Manifest.permission.CAMERA])
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val saveIntent = Intent("dev.rylry.SAVE_BUFFERS")
+        val pendingIntent: PendingIntent = PendingIntent.getBroadcast(
+            this,
+            0,
+            saveIntent,
+            PendingIntent.FLAG_IMMUTABLE
+        )
         // Create notification
         val channelId = "RecordingServiceChannel"
         createNotificationChannel(channelId)
@@ -84,6 +95,11 @@ class RecordingService : Service() {
             .setContentTitle("Recording Audio")
             .setContentText("Your audio is being recorded")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .addAction(
+                android.R.drawable.ic_btn_speak_now,
+                "Save",
+                pendingIntent
+            )
             .build()
 
         // Start foreground
@@ -91,14 +107,19 @@ class RecordingService : Service() {
 
         // Start recording in background thread
         startAudio()
-        startCamera()
-
         return START_STICKY
+    }
+
+    private val saveReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            saveMedia()
+        }
     }
 
     override fun onDestroy() {
         super.onDestroy()
         stopRecording()
+        unregisterReceiver(saveReceiver)
         record?.release()
         record = null
     }
