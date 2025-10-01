@@ -96,6 +96,8 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+
+
     override fun onStart() {
         super.onStart()
         val intent = Intent(this, RecordingService::class.java)
