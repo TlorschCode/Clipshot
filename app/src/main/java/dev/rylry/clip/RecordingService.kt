@@ -10,115 +10,111 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.graphics.ImageFormat
-import android.hardware.camera2.CameraCaptureSession
-import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CameraDevice
-import android.hardware.camera2.CameraManager
-import android.media.AudioFormat
-import android.media.AudioRecord
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
-import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.media.MediaMuxer
-import android.media.MediaRecorder
-import android.hardware.camera2.CameraAccessException
 import android.net.Uri
 import android.os.Binder
 import android.os.Build
 import android.os.Environment
+import android.os.Handler
 import android.os.IBinder
+import android.os.PowerManager
 import android.provider.MediaStore
-import android.util.Log
-import android.view.Surface
 import androidx.annotation.RequiresPermission
 import androidx.core.app.NotificationCompat
+import androidx.media.app.NotificationCompat as MediaNotificationCompat
 import java.io.File
 import java.io.FileInputStream
-import java.nio.ByteBuffer
 import kotlin.math.min
 
-
 class RecordingService : Service() {
-    var sampleRateHz: Int = 44100 // Example sample rate
-    var recordDurationSeconds: Int = 30
-    var channelConfig: Int = AudioFormat.CHANNEL_IN_MONO
-    var audioFormat: Int = AudioFormat.ENCODING_PCM_16BIT
-    var audioBufferSize: Int = sampleRateHz * recordDurationSeconds * 2 // Because PCM16 is 2 bytes/sample
-    var audioBuffer = ByteArray(audioBufferSize)
-    var audioWritePointer: Int = 0
-    var audioChunkSize: Int = AudioRecord.getMinBufferSize(sampleRateHz, channelConfig, audioFormat)
-    var isRecording: Boolean = false
-    var isRecordingVideo: Boolean = false
-    var recordingThread: Thread? = null
-    var record: AudioRecord? = null
-
-    lateinit var cameraDevice: CameraDevice
-    lateinit var videoBuffer : ArrayDeque<Pair<ByteArray, MediaCodec.BufferInfo>>
-    lateinit var encoder: MediaCodec
-    lateinit var inputSurface: Surface
-
-    private var videoBasePts: Long = -1
-    private var lastVideoPts: Long = 0
-
     private val binder = AudioServiceBinder()
 
     inner class AudioServiceBinder : Binder() {
         fun getService(): RecordingService = this@RecordingService
     }
 
-    override fun onBind(intent: Intent?): IBinder {
-        return binder
+    private lateinit var wakeLock: PowerManager.WakeLock
+
+    private val watchdogInterval = 5000L // 5 seconds
+    private val watchdogRunnable = object : Runnable {
+        override fun run() {
+            try {
+                val active = NativeAudio.isRecordingActive() // Add this JNI method
+                if (!active) {
+                    NativeAudio.stop()
+                    NativeAudio.start()
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                NativeAudio.stop()
+                NativeAudio.start()
+            } finally {
+                handler.postDelayed(this, watchdogInterval)
+            }
+        }
     }
+    private lateinit var handler: Handler
 
+    override fun onBind(intent: Intent?): IBinder = binder
 
-    @RequiresPermission(allOf = [Manifest.permission.RECORD_AUDIO])
     override fun onCreate() {
         super.onCreate()
-        registerReceiver(saveReceiver, IntentFilter("dev.rylry.SAVE_BUFFERS"), Context.RECEIVER_EXPORTED)
-        record = AudioRecord(
-            MediaRecorder.AudioSource.MIC,
-            sampleRateHz,
-            channelConfig,
-            audioFormat,
-            audioBufferSize
+
+        handler = Handler(getMainLooper())
+
+
+        registerReceiver(
+            saveReceiver,
+            IntentFilter("dev.rylry.SAVE_BUFFERS"),
+            RECEIVER_EXPORTED
         )
     }
 
+    @RequiresPermission(allOf = [Manifest.permission.RECORD_AUDIO])
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val saveIntent = Intent("dev.rylry.SAVE_BUFFERS")
         val pendingIntent: PendingIntent = PendingIntent.getBroadcast(
-            this,
-            0,
-            saveIntent,
-            PendingIntent.FLAG_IMMUTABLE
+            this, 0, saveIntent, PendingIntent.FLAG_IMMUTABLE
         )
-        // Create notification
+
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Clip::Recording")
+        wakeLock.acquire()
+        startRecording()
+        handler.post(watchdogRunnable)
+
         val channelId = "RecordingServiceChannel"
         createNotificationChannel(channelId)
+
         val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("Recording Audio")
-            .setContentText("Your audio is being recorded")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setContentTitle("Recording Audio")
+            .setContentText("Tap button to clip last 30 seconds")
+            .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_MAX)
             .addAction(
-                android.R.drawable.ic_btn_speak_now,
+                android.R.drawable.ic_menu_add,
                 "Save",
                 pendingIntent
             )
+            .setStyle(
+                MediaNotificationCompat.MediaStyle()
+                    .setShowActionsInCompactView(0) // show first action collapsed
+            )
             .build()
 
-        // Start foreground
         startForeground(1, notification)
+        startRecording()
 
-        // Start recording in background thread
-        startAudio()
         return START_STICKY
     }
 
     private val saveReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            saveMedia()
+            saveBuffersM4A()
         }
     }
 
@@ -126,398 +122,130 @@ class RecordingService : Service() {
         super.onDestroy()
         stopRecording()
         unregisterReceiver(saveReceiver)
-        record?.release()
-        record = null
     }
 
     private fun createNotificationChannel(channelId: String) {
         val channel = NotificationChannel(
-            channelId,
-            "Audio Recording Service",
-            NotificationManager.IMPORTANCE_LOW
-        )
+            channelId, "Audio Recording Service", NotificationManager.IMPORTANCE_HIGH
+        ).apply {
+            enableVibration(true)
+        }
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(channel)
     }
 
-    fun startAudio(){
-        isRecording = true
-        record?.startRecording()
-        recordingThread = Thread {
-            while (isRecording) {
-                val firstChunkSize = min(audioChunkSize, audioBufferSize - audioWritePointer)
-
-                // Read up to firstChunkSize frames
-                val readFirst = record?.read(audioBuffer, audioWritePointer, firstChunkSize) ?: 0
-
-                // If there’s remaining to wrap around the circular buffer
-                val remaining = audioChunkSize - readFirst
-                if (remaining > 0) {
-                    // Only read as much as fits at the start of the buffer
-                    record?.read(audioBuffer, 0, remaining)
-                }
-                audioWritePointer = (audioWritePointer + audioChunkSize) % audioBufferSize
-            }
-        }
-        recordingThread?.start()
+    @RequiresPermission(Manifest.permission.RECORD_AUDIO)
+    fun startRecording() {
+        NativeAudio.start()
     }
 
     fun stopRecording() {
-        isRecording = false
-        try {
-            recordingThread?.join()
-        } catch (e: InterruptedException) {
-            e.printStackTrace()
-        }
-        record?.stop()
+        NativeAudio.stop()
     }
 
-    @RequiresPermission(Manifest.permission.CAMERA)
-    fun startCamera() {
-        val manager: CameraManager = getSystemService(CAMERA_SERVICE) as CameraManager
+    fun saveBuffersM4A() {
+        val clipTime = System.currentTimeMillis()
+        val outputFile = File(filesDir, "cache.m4a")
 
-        val cameras = try {
-            manager.cameraIdList.filter {
-                val characteristics = manager.getCameraCharacteristics(it)
-                val lensFacing = characteristics.get(CameraCharacteristics.LENS_FACING)
-                lensFacing != null && lensFacing == CameraCharacteristics.LENS_FACING_BACK
-            }
-        } catch (e: Exception) {
-            Log.e("RecordingService", "Failed to get camera list: ${e.message}")
-            return
-        }
+        // Fetch raw PCM from JNI layer
+        val buffer = ByteArray(44100 * 30 * 2)
+        NativeAudio.copySnapshot(buffer)
 
-        if (cameras.isEmpty()) {
-            Log.w("RecordingService", "No suitable back-facing camera found")
-            return
-        }
+        val sampleRate = 44100
+        val channelCount = 1
+        val bitRate = 128_000
 
-        val camera = cameras[0]
-        try {
-            manager.openCamera(camera, object : CameraDevice.StateCallback() {
-                override fun onDisconnected(camera: CameraDevice) {
-                    try {
-                        camera.close()
-                    } catch (e: Exception) {
-                        Log.w("RecordingService", "Error closing disconnected camera: ${e.message}")
-                    }
-                }
-
-                override fun onError(camera: CameraDevice, error: Int) {
-                    Log.w("RecordingService", "Camera error $error")
-                    try {
-                        camera.close()
-                    } catch (e: Exception) {
-                        Log.w("RecordingService", "Error closing camera on error: ${e.message}")
-                    }
-                }
-
-                override fun onOpened(camera: CameraDevice) {
-                    cameraDevice = camera
-                    setupCaptureSession()
-                }
-            }, null)
-        } catch (e: CameraAccessException) {
-            Log.e("RecordingService", "Camera access exception: ${e.message}")
-        } catch (e: SecurityException) {
-            Log.e("RecordingService", "Camera permission missing: ${e.message}")
-        } catch (e: Exception) {
-            Log.e("RecordingService", "Unknown camera open exception: ${e.message}")
-        }
-
-        val characteristics = try {
-            manager.getCameraCharacteristics(camera)
-        } catch (e: Exception) {
-            Log.w("RecordingService", "Failed to get camera characteristics: ${e.message}")
-            return
-        }
-
-        val map = try {
-            characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return
-        } catch (e: Exception) {
-            Log.w("RecordingService", "Failed to get stream configuration map: ${e.message}")
-            return
-        }
-
-        val codecList = MediaCodecList(MediaCodecList.REGULAR_CODECS)
-        val codecInfo = try {
-            codecList.codecInfos.first { it.isEncoder && it.supportedTypes.contains(MediaFormat.MIMETYPE_VIDEO_AVC) }
-        } catch (e: Exception) {
-            Log.e("RecordingService", "No suitable encoder found: ${e.message}")
-            return
-        }
-
-        val videoCaps = codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC).videoCapabilities
-        val supportedCameraSizes = map.getOutputSizes(ImageFormat.YUV_420_888)
-        val size = supportedCameraSizes
-            .firstOrNull { s -> videoCaps.isSizeSupported(s.width, s.height) }
-            ?: supportedCameraSizes.first()
-
-        val supportedFpsRange = videoCaps.getSupportedFrameRatesFor(size.width, size.height)
-        val fps: Int = supportedFpsRange.upper.toInt()
-
-        val bitsPerPixel = 0.1
-        val bitRate = (size.width * size.height * fps * bitsPerPixel).toInt()
-
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, size.width, size.height)
-            .apply {
-                setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
-                setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-                setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            }
-
-        try {
-            encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-            encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-
-            val videoBufferSize = fps * 30
-            videoBuffer = ArrayDeque<Pair<ByteArray, MediaCodec.BufferInfo>>(videoBufferSize)
-
-            encoder.setCallback(object : MediaCodec.Callback() {
-                override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
-                    Log.e("RecordingService", "Encoder error: ${e.message}")
-                }
-
-                override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {
-                    // No-op
-                }
-
-                override fun onOutputBufferAvailable(codec: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
-                    try {
-                        if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
-                            codec.releaseOutputBuffer(index, false)
-                            return
-                        }
-
-                        if (info.size > 0) {
-                            val encodedData = codec.getOutputBuffer(index) ?: return
-                            encodedData.position(info.offset)
-                            encodedData.limit(info.offset + info.size)
-
-                            if (videoBasePts < 0) videoBasePts = info.presentationTimeUs
-                            val pts = info.presentationTimeUs - videoBasePts
-                            val flags = if (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0 || videoBuffer.isEmpty()) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
-                            val frameBytes = ByteArray(info.size)
-                            encodedData.get(frameBytes)
-
-                            synchronized(videoBuffer) {
-                                while (videoBuffer.isNotEmpty() && pts - videoBuffer.first().second.presentationTimeUs > recordDurationSeconds * 1_000_000) {
-                                    videoBuffer.removeFirst()
-                                }
-                                videoBuffer.addLast(Pair(
-                                    frameBytes,
-                                    MediaCodec.BufferInfo().apply { set(info.offset, info.size, pts, flags) }
-                                ))
-                            }
-                        } else {
-                            Log.w("RecordingService", "Empty output buffer. Flags: ${info.flags}")
-                        }
-                    } catch (e: Exception) {
-                        Log.e("RecordingService", "Error handling output buffer: ${e.message}")
-                    } finally {
-                        try { codec.releaseOutputBuffer(index, false) } catch (_: Exception) {}
-                    }
-                }
-
-                override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
-                    // No-op
-                }
-            })
-
-            inputSurface = encoder.createInputSurface()
-            encoder.start()
-        } catch (e: Exception) {
-            Log.e("RecordingService", "Failed to configure/start encoder: ${e.message}")
-        }
-    }
-
-    private fun setupCaptureSession() {
-        val surfaces = listOf(inputSurface)
-        try {
-            cameraDevice.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
-                override fun onConfigured(session: CameraCaptureSession) {
-                    try {
-                        val captureRequestBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-                            addTarget(inputSurface)
-                        }
-                        session.setRepeatingRequest(captureRequestBuilder.build(), null, null)
-                    } catch (e: CameraAccessException) {
-                        Log.w("RecordingService", "Failed to start repeating request: ${e.message}")
-                    } catch (e: IllegalStateException) {
-                        Log.w("RecordingService", "Capture session illegal state: ${e.message}")
-                    }
-                }
-
-                override fun onConfigureFailed(session: CameraCaptureSession) {
-                    Log.w("RecordingService", "Capture session configuration failed")
-                }
-            }, null)
-        } catch (e: CameraAccessException) {
-            Log.w("RecordingService", "Failed to create capture session: ${e.message}")
-        } catch (e: IllegalStateException) {
-            Log.w("RecordingService", "Camera device illegal state during capture session creation: ${e.message}")
-        } catch (e: Exception) {
-            Log.w("RecordingService", "Unknown error creating capture session: ${e.message}")
-        }
-    }
-    fun saveMedia() {
-        // Retrieve and prepare audio PCM data from the in-memory buffer
-        val first = audioBuffer.copyOfRange(audioWritePointer, audioBuffer.size)
-        val second = audioBuffer.copyOfRange(0, audioWritePointer)
-        val pcmData = first + second
-
-        val time = System.currentTimeMillis()
-
-        // --- Audio encoding setup ---
-        val audioSampleRate = 44100
-        val audioChannelCount = 1
-        val audioBitRate = 128_000
-
-        val audioFormat = MediaFormat.createAudioFormat(
-            MediaFormat.MIMETYPE_AUDIO_AAC,
-            audioSampleRate,
-            audioChannelCount
+        val format = MediaFormat.createAudioFormat(
+            MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, channelCount
         ).apply {
             setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
-            setInteger(MediaFormat.KEY_BIT_RATE, audioBitRate)
+            setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
             setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
         }
 
-        val audioEncoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
-        audioEncoder.configure(audioFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        audioEncoder.start()
+        val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+        encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        encoder.start()
 
-        // --- Encode audio synchronously and gather encoded frames ---
-        val encodedAudioFrames = mutableListOf<Pair<ByteArray, MediaCodec.BufferInfo>>()
-        val audioBufferInfo = MediaCodec.BufferInfo()
-        val inputBuffers = audioEncoder.inputBuffers
-        val outputBuffers = audioEncoder.outputBuffers
+        val muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        var muxerTrackIndex = -1
+        var muxerStarted = false
+
+        val bufferInfo = MediaCodec.BufferInfo()
         var pcmOffset = 0
 
-        while (pcmOffset < pcmData.size) {
-            // Feed PCM to encoder
-            val inputIndex = audioEncoder.dequeueInputBuffer(10000)
+        while (pcmOffset < buffer.size) {
+            val inputIndex = encoder.dequeueInputBuffer(10000)
             if (inputIndex >= 0) {
-                val inputBuffer = inputBuffers[inputIndex]
+                val inputBuffer = encoder.getInputBuffer(inputIndex)!!
                 inputBuffer.clear()
+                val bytesToWrite = min(inputBuffer.capacity(), buffer.size - pcmOffset)
+                inputBuffer.put(buffer, pcmOffset, bytesToWrite)
 
-                val bytesToWrite = min(inputBuffer.capacity(), pcmData.size - pcmOffset)
-                inputBuffer.put(pcmData, pcmOffset, bytesToWrite)
-
-                val presentationTimeUs = (pcmOffset.toLong() * 1_000_000L) / (audioSampleRate * 2 * audioChannelCount)
-                audioEncoder.queueInputBuffer(inputIndex, 0, bytesToWrite, presentationTimeUs, 0)
+                val presentationTimeUs = (pcmOffset.toLong() * 1_000_000L) / (sampleRate * 2 * channelCount)
+                encoder.queueInputBuffer(inputIndex, 0, bytesToWrite, presentationTimeUs, 0)
                 pcmOffset += bytesToWrite
             }
 
-            // Get encoded output and store it
-            var outputIndex = audioEncoder.dequeueOutputBuffer(audioBufferInfo, 10000)
+            var outputIndex = encoder.dequeueOutputBuffer(bufferInfo, 10000)
             while (outputIndex >= 0) {
-                val encodedData = outputBuffers[outputIndex]
-                val encodedFrameBytes = ByteArray(audioBufferInfo.size)
-                encodedData.position(audioBufferInfo.offset)
-                encodedData.limit(audioBufferInfo.offset + audioBufferInfo.size)
-                encodedData.get(encodedFrameBytes)
-
-                encodedAudioFrames.add(encodedFrameBytes to MediaCodec.BufferInfo().apply {
-                    set(audioBufferInfo.offset, audioBufferInfo.size, audioBufferInfo.presentationTimeUs, audioBufferInfo.flags)
-                })
-                audioEncoder.releaseOutputBuffer(outputIndex, false)
-                outputIndex = audioEncoder.dequeueOutputBuffer(audioBufferInfo, 0)
+                val encodedData = encoder.getOutputBuffer(outputIndex)!!
+                if (!muxerStarted) {
+                    muxerTrackIndex = muxer.addTrack(encoder.outputFormat)
+                    muxer.start()
+                    muxerStarted = true
+                }
+                muxer.writeSampleData(muxerTrackIndex, encodedData, bufferInfo)
+                encoder.releaseOutputBuffer(outputIndex, false)
+                outputIndex = encoder.dequeueOutputBuffer(bufferInfo, 0)
             }
         }
 
-        // --- Signal end of stream for audio ---
-        val inputIndex = audioEncoder.dequeueInputBuffer(10000)
-        if (inputIndex >= 0) {
-            audioEncoder.queueInputBuffer(inputIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+        // Signal EOS
+        val finalInputIndex = encoder.dequeueInputBuffer(10000)
+        if (finalInputIndex >= 0) {
+            encoder.queueInputBuffer(finalInputIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
         }
 
-        // Drain remaining audio output
-        var outputIndex = audioEncoder.dequeueOutputBuffer(audioBufferInfo, 10000)
-        while (outputIndex >= 0) {
-            val encodedData = outputBuffers[outputIndex]
-            val encodedFrameBytes = ByteArray(audioBufferInfo.size)
-            encodedData.position(audioBufferInfo.offset)
-            encodedData.limit(audioBufferInfo.offset + audioBufferInfo.size)
-            encodedData.get(encodedFrameBytes)
-
-            encodedAudioFrames.add(encodedFrameBytes to MediaCodec.BufferInfo().apply {
-                set(audioBufferInfo.offset, audioBufferInfo.size, audioBufferInfo.presentationTimeUs, audioBufferInfo.flags)
-            })
-            audioEncoder.releaseOutputBuffer(outputIndex, false)
-            outputIndex = audioEncoder.dequeueOutputBuffer(audioBufferInfo, 0)
+        // Drain remaining output
+        var finalOutputIndex = encoder.dequeueOutputBuffer(bufferInfo, 10000)
+        while (finalOutputIndex >= 0) {
+            val encodedData = encoder.getOutputBuffer(finalOutputIndex)!!
+            muxer.writeSampleData(muxerTrackIndex, encodedData, bufferInfo)
+            encoder.releaseOutputBuffer(finalOutputIndex, false)
+            finalOutputIndex = encoder.dequeueOutputBuffer(bufferInfo, 0)
         }
 
-        val videoOutputFormat = encoder.getOutputFormat()
-        val outputFile = File(filesDir, "cache.mp4")
-
-        // --- Muxer setup ---
-        val muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-        val videoTrackIndex = muxer.addTrack(videoOutputFormat)
-        var audioTrackIndex = muxer.addTrack(audioFormat)
-        muxer.start()
-
-        // --- Write all frames to muxer in chronological order ---
-        val videoBasePts = try {
-            videoBuffer.first().second.presentationTimeUs
-        } catch(e: NoSuchElementException){
-            0
-        }
-        val allFrames = (encodedAudioFrames.map { (bytes, info) ->
-            FrameWrapper(bytes, info, audioTrackIndex)
-        } + videoBuffer.map { (bytes, info) ->
-            FrameWrapper(bytes, MediaCodec.BufferInfo().apply {
-                set(info.offset, info.size, info.presentationTimeUs - videoBasePts, info.flags)
-            }, videoTrackIndex)
-        }.sortedBy { it.info.presentationTimeUs })
-
-
-    for (frame in allFrames) {
-            muxer.writeSampleData(frame.trackIndex, ByteBuffer.wrap(frame.bytes), frame.info)
-        }
-
-        // --- Cleanup ---
-        audioEncoder.stop()
-        audioEncoder.release()
+        encoder.stop()
+        encoder.release()
         muxer.stop()
         muxer.release()
 
-        downloadCache(this, time)
+        downloadCache(this, clipTime)
     }
 
-    // Helper class to store frame data and track index
-    data class FrameWrapper(
-        val bytes: ByteArray,
-        val info: MediaCodec.BufferInfo,
-        val trackIndex: Int
-    )
-
     fun downloadCache(context: Context, time: Long) {
-        val sourceFile = File(context.filesDir, "cache.mp4")
+        val sourceFile = File(context.filesDir, "cache.m4a")
         if (!sourceFile.exists()) return
 
         val values = ContentValues().apply {
-            put(MediaStore.Audio.Media.DISPLAY_NAME, "clip_${time}")
-            put(MediaStore.Audio.Media.MIME_TYPE, "video/mp4")
+            put(MediaStore.Audio.Media.DISPLAY_NAME, "clip_${time}.m4a")
+            put(MediaStore.Audio.Media.MIME_TYPE, "audio/mp4")
             put(MediaStore.Audio.Media.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
         }
 
         val resolver = context.contentResolver
-        val uri: Uri = (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        val uri: Uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
         } else {
-            val musicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC)
-            if (!musicDir.exists()) musicDir.mkdirs()
-            val destFile = File(musicDir, "clip_${time}.mp4")
-            Uri.fromFile(destFile)
-        })!!
+            // TODO: Handle Legacy Storage for pre-Q if needed
+            null
+        } ?: return
 
-        resolver.openOutputStream(uri, "w")?.use { out ->
+        resolver.openOutputStream(uri)?.use { out ->
             FileInputStream(sourceFile).use { input ->
                 input.copyTo(out)
             }
-            out.flush()   // ensure all bytes are written
         }
     }
 }

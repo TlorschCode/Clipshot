@@ -5,18 +5,14 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
-import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import android.os.Environment
 import android.os.IBinder
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import android.widget.Button
 import android.widget.Toast
-import androidx.core.app.ActivityCompat
-import java.io.File
 
 class MainActivity : ComponentActivity() {
     private var recordingService: RecordingService? = null
@@ -36,7 +32,7 @@ class MainActivity : ComponentActivity() {
             text = "Save Current Buffer"
             setOnClickListener {
                 if (bound) {
-                    recordingService?.saveMedia()
+                    recordingService?.saveBuffersM4A()
                     Toast.makeText(this@MainActivity, "Buffer saved!", Toast.LENGTH_SHORT).show()
                 } else {
                     Toast.makeText(this@MainActivity, "Service not bound", Toast.LENGTH_SHORT)
@@ -99,6 +95,8 @@ class MainActivity : ComponentActivity() {
             bound = false
         }
     }
+
+
 
     override fun onStart() {
         super.onStart()
