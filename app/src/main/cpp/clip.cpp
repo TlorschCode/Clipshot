@@ -6,9 +6,10 @@
 #include <algorithm>
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "NativeAudio", __VA_ARGS__)
-#define SAMPLE_RATE 44100
-#define CHANNELS 1
-#define DURATION_SECONDS 30
+constexpr uint16_t SAMPLE_RATE = 44100;
+constexpr uint8_t CHANNELS = 1;
+constexpr uint8_t DURATION_SECONDS = 30;
+constexpr uint64_t NANOS_PER_SEC = 1000000000ULL;
 
 static std::shared_ptr<oboe::AudioStream> stream;
 static std::atomic<bool> gRecordingActive{false};
@@ -17,7 +18,7 @@ static std::atomic<uint64_t> gLastCallbackNs{0};
 static inline int64_t nowNs() {
     timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1'000'000'000LL + ts.tv_nsec;
+    return (int64_t)ts.tv_sec * NANOS_PER_SEC + ts.tv_nsec;
 }
 
 class InputCallback : public oboe::AudioStreamCallback {
@@ -114,7 +115,7 @@ Java_dev_rylry_clip_NativeAudio_isRecordingActive(JNIEnv*, jobject) {
     uint64_t lastNs = gLastCallbackNs.load(std::memory_order_relaxed);
 
     // No callbacks in the last 2 seconds → dead
-    constexpr uint64_t TIMEOUT_NS = 2'000'000'000ULL;
+    constexpr uint64_t TIMEOUT_NS = NANOS_PER_SEC * 2;
 
     return (nowNs() - lastNs) < TIMEOUT_NS ? JNI_TRUE : JNI_FALSE;
 }
@@ -129,14 +130,14 @@ Java_dev_rylry_clip_NativeAudio_copySnapshot(JNIEnv* env, jobject, jbyteArray ou
     jbyte* buffer = env->GetByteArrayElements(outArray, nullptr);
     if (!buffer) return;
 
-    int frames = len / 2; // 2 bytes per frame (mono PCM16)
-    int write = callback.mWriteIndex.load(std::memory_order_acquire);
+    size_t frames = len / 2; // 2 bytes per frame (mono PCM16)
+    size_t write = callback.mWriteIndex.load(std::memory_order_acquire);
     int totalSamples = frames; // 1 sample per frame for mono
 
-    int start = write - totalSamples;
+    size_t start = write - totalSamples;
     if (start < 0) start += callback.mBuffer.size();
 
-    for (int i = 0; i < totalSamples; ++i) {
+    for (size_t i = 0; i < totalSamples; ++i) {
         int16_t sample = callback.mBuffer[(start + i) % callback.mBuffer.size()];
         buffer[2*i]     = static_cast<jbyte>(sample & 0xFF);
         buffer[2*i + 1] = static_cast<jbyte>((sample >> 8) & 0xFF);
