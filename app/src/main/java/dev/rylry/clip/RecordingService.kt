@@ -29,6 +29,8 @@ import java.io.File
 import java.io.FileInputStream
 import kotlin.math.min
 
+private const val TIMEOUT_MCRS = 10000
+
 class RecordingService : Service() {
     private val binder = AudioServiceBinder()
 
@@ -147,20 +149,23 @@ class RecordingService : Service() {
         val clipTime = System.currentTimeMillis()
         val outputFile = File(filesDir, "cache.m4a")
 
-        // Fetch raw PCM from JNI layer
-        val buffer = ByteArray(44100 * 30 * 2)
-        NativeAudio.copySnapshot(buffer)
-
         val sampleRate = 44100
+        val sampleLength = 30
+        val bytesPerSample = 2
         val channelCount = 1
         val bitRate = 128_000
+        val maxCodecInputBytes = 16 * 1024 // 16384
+
+        // Fetch raw PCM from JNI layer
+        val buffer = ByteArray(sampleRate * sampleLength * bytesPerSample)
+        NativeAudio.copySnapshot(buffer)
 
         val format = MediaFormat.createAudioFormat(
             MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, channelCount
         ).apply {
             setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
             setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
-            setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
+            setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, maxCodecInputBytes)
         }
 
         val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
@@ -175,19 +180,19 @@ class RecordingService : Service() {
         var pcmOffset = 0
 
         while (pcmOffset < buffer.size) {
-            val inputIndex = encoder.dequeueInputBuffer(10000)
+            val inputIndex = encoder.dequeueInputBuffer(TIMEOUT_MCRS)
             if (inputIndex >= 0) {
                 val inputBuffer = encoder.getInputBuffer(inputIndex)!!
                 inputBuffer.clear()
                 val bytesToWrite = min(inputBuffer.capacity(), buffer.size - pcmOffset)
                 inputBuffer.put(buffer, pcmOffset, bytesToWrite)
 
-                val presentationTimeUs = (pcmOffset.toLong() * 1_000_000L) / (sampleRate * 2 * channelCount)
+                val presentationTimeUs = (pcmOffset.toLong() * 1_000_000L) / (sampleRate * 2 * channelCount) // 1,000,000 to convert microseconds to seconds
                 encoder.queueInputBuffer(inputIndex, 0, bytesToWrite, presentationTimeUs, 0)
                 pcmOffset += bytesToWrite
             }
 
-            var outputIndex = encoder.dequeueOutputBuffer(bufferInfo, 10000)
+            var outputIndex = encoder.dequeueOutputBuffer(bufferInfo, TIMEOUT_MCRS)
             while (outputIndex >= 0) {
                 val encodedData = encoder.getOutputBuffer(outputIndex)!!
                 if (!muxerStarted) {
@@ -202,13 +207,13 @@ class RecordingService : Service() {
         }
 
         // Signal EOS
-        val finalInputIndex = encoder.dequeueInputBuffer(10000)
+        val finalInputIndex = encoder.dequeueInputBuffer(TIMEOUT_MCRS)
         if (finalInputIndex >= 0) {
             encoder.queueInputBuffer(finalInputIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
         }
 
         // Drain remaining output
-        var finalOutputIndex = encoder.dequeueOutputBuffer(bufferInfo, 10000)
+        var finalOutputIndex = encoder.dequeueOutputBuffer(bufferInfo, TIMEOUT_MCRS)
         while (finalOutputIndex >= 0) {
             val encodedData = encoder.getOutputBuffer(finalOutputIndex)!!
             muxer.writeSampleData(muxerTrackIndex, encodedData, bufferInfo)
